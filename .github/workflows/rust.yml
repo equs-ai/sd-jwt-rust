@@ -10,13 +10,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, features: "" }
+          - { name: delegate, features: "delegate" }
 
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --verbose --features "${{ matrix.features }}"
+    - name: Run tests
+      run: cargo test --verbose --features "${{ matrix.features }}"
+
+  wasm:
+    name: build (wasm32)
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
     - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      run: cargo build --verbose --target wasm32-unknown-unknown --features delegate
