@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to this fork.
+All notable changes to this fork are documented here.
 
 This is a fork of [openwallet-foundation-labs/sd-jwt-rust](https://github.com/openwallet-foundation-labs/sd-jwt-rust),
 diverged at `08d75c7`.
@@ -14,6 +14,7 @@ diverged at `08d75c7`.
 - The issuer is generic over a signer, verification takes a key resolver, and issuance, presentation and verification are `async`.
 - Always-revealed root claims are now `iss`, `exp`, `nbf`, `aud`; `iat` became selectively disclosable, and `exp` is no longer required at verification time.
 - The `sd-jwt-generate` tool under `generate/` no longer builds against the new API.
+- Published as `equs-sd-jwt-rs`; the library target stays `sd_jwt_rs`, so `use sd_jwt_rs::…` is unchanged.
 
 ### Fixed
 - A claim in `claims_to_disclose` absent from the disclosures panicked; it now errors, and may be marked `"optional"` to be skipped instead.
