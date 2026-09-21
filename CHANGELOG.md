@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to this fork.
+All notable changes to this fork are documented here.
 
 This is a fork of [openwallet-foundation-labs/sd-jwt-rust](https://github.com/openwallet-foundation-labs/sd-jwt-rust),
 diverged at `08d75c7`.
