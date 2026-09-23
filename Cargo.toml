@@ -6,6 +6,7 @@ license = "Apache-2.0 OR MIT"
 description = "Rust reference implementation of the IETF SD-JWT specification (v7)."
 rust-version = "1.67.0"
 repository = "https://github.com/equs-ai/sd-jwt-rust"
+exclude = [".github/", ".gitignore", "CODEOWNERS"]
 
 [lib]
 name = "sd_jwt_rs"
