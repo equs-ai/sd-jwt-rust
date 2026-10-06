@@ -19,3 +19,5 @@ diverged at `08d75c7`.
 ### Fixed
 - A claim in `claims_to_disclose` absent from the disclosures panicked; it now errors, and may be marked `"optional"` to be skipped instead.
 - `nbf` / `exp` on chain links, and `aud` / `nonce` for `kb+sd-jwt(+kb)`, are now validated.
+- A disclosure of the wrong length for its position (a claim needs `[salt, name, value]`, an array item `[salt, value]`) panicked the verifier; it is now `InvalidDisclosure`.
+- A decoy digest in an array panicked the holder when the array was disclosed; decoys are now skipped.
