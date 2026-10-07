@@ -656,12 +656,17 @@ fn select_disclosures_from_disclosed_list(
         match (claim_to_disclose, sd_jwt_claims) {
             (Value::Bool(true), Value::Object(sd_jwt_claims)) => {
                 if let Some(Value::String(digest)) = sd_jwt_claims.get(SD_LIST_PREFIX) {
-                    hash_to_disclosure.push(hash_to_raw[digest].to_owned());
+                    if let Some(raw) = hash_to_raw.get(digest) {
+                        hash_to_disclosure.push(raw.to_owned());
+                    }
                 }
             }
             (claim_to_disclose, Value::Object(sd_jwt_claims)) => {
                 if let Some(Value::String(digest)) = sd_jwt_claims.get(SD_LIST_PREFIX) {
-                    let disclosure = hash_to_decoded[digest]
+                    let Some(decoded) = hash_to_decoded.get(digest) else {
+                        continue;
+                    };
+                    let disclosure = decoded
                         .as_array()
                         .ok_or(Error::ConversionError("json array".to_string()))?;
                     match (claim_to_disclose, disclosure.get(1)) {
@@ -1334,6 +1339,44 @@ mod tests {
         let expected = parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         assert_eq!(expected, presentation);
 
+        Ok(())
+    }
+
+    #[async_test]
+    async fn create_presentation_skips_decoy_digests_in_arrays() -> std::io::Result<()> {
+        let disclosure =
+            crate::utils::base64url_encode(json!(["salt", "DE"]).to_string().as_bytes());
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "exp": 4102444800u64,
+            "_sd_alg": "sha-256",
+            "nationalities": [
+                { "...": crate::utils::base64_hash(b"decoy") },
+                { "...": crate::utils::base64_hash(disclosure.as_bytes()) }
+            ]
+        });
+        let key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        let sd_jwt = format!(
+            "{}~{disclosure}~",
+            jsonwebtoken::encode(&header, &payload, &key).unwrap()
+        );
+
+        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation::<SDJWTKey>(
+                json!({ "nationalities": [true, true] })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(presentation.contains(&disclosure));
         Ok(())
     }
 }

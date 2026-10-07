@@ -982,11 +982,14 @@ fn unpack_from_digests(
                     .ok_or(Error::InvalidArrayDisclosureObject(
                         value_for_digest.to_string(),
                     ))?;
-            let key = disclosure[1]
+            let [_, key, value] = disclosure.as_slice() else {
+                return Err(Error::InvalidDisclosure(value_for_digest.to_string()));
+            };
+            let key = key
                 .as_str()
                 .ok_or(Error::ConversionError("str".to_string()))?
                 .to_owned();
-            let value = disclosure[2].clone();
+            let value = value.clone();
             if pre_output.contains_key(&key) {
                 return Err(Error::DuplicateKeyError(key.to_string()));
             }
@@ -1020,8 +1023,10 @@ fn unpack_from_digest(
                 value_for_digest.to_string(),
             ))?;
 
-        let value = disclosure[1].clone();
-        let unpacked_value = unpack_disclosed_claims(&value, hash_to_decoded, seen)?;
+        let [_, value] = disclosure.as_slice() else {
+            return Err(Error::InvalidDisclosure(value_for_digest.to_string()));
+        };
+        let unpacked_value = unpack_disclosed_claims(value, hash_to_decoded, seen)?;
         return Ok(Some(unpacked_value));
     } else {
         debug!("Digest {:?} skipped as decoy", digest)
@@ -1501,5 +1506,56 @@ mod tests {
         assert_eq!(claims_to_check, verified_claims);
 
         Ok(())
+    }
+
+    fn issued(payload: Value, disclosures: &[&str]) -> String {
+        let key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        let jwt = jsonwebtoken::encode(&header, &payload, &key).unwrap();
+        disclosures
+            .iter()
+            .fold(format!("{jwt}~"), |token, disclosure| {
+                format!("{token}{disclosure}~")
+            })
+    }
+
+    #[rstest::rstest]
+    #[case::claim_without_a_name(json!(["salt", "value"]), false)]
+    #[case::claim_with_only_a_salt(json!(["salt"]), false)]
+    #[case::array_item_with_a_name(json!(["salt", "name", "value"]), true)]
+    #[async_std::test]
+    async fn verify_rejects_a_disclosure_of_the_wrong_length(
+        #[case] disclosure: Value,
+        #[case] in_array: bool,
+    ) {
+        let disclosure = crate::utils::base64url_encode(disclosure.to_string().as_bytes());
+        let digest = crate::utils::base64_hash(disclosure.as_bytes());
+        let mut payload = json!({
+            "iss": "https://example.com/issuer",
+            "exp": 4102444800u64,
+            "_sd_alg": "sha-256"
+        });
+        if in_array {
+            payload["items"] = json!([{ "...": digest }]);
+        } else {
+            payload["_sd"] = json!([digest]);
+        }
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes())
+            .unwrap()
+            .into();
+
+        let result = SDJWTVerifier::new(Box::new(issuer_pub_key))
+            .verify_presentation(
+                issued(payload, &[&disclosure]),
+                None,
+                None,
+                SDJWTSerializationFormat::Compact,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(crate::error::Error::InvalidDisclosure(_))),
+            "{result:?}"
+        );
     }
 }
