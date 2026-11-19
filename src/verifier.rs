@@ -14,6 +14,7 @@ use std::ops::Add;
 use std::option::Option;
 use std::str::FromStr;
 use std::string::String;
+use std::time::Duration;
 use std::vec::Vec;
 
 #[cfg(feature = "delegate")]
@@ -29,6 +30,24 @@ use crate::{
 use crate::{
     DELEGATE_PAYLOAD_KEY, ISSUER_JWT_HASH_KEY, KB_SD_JWT_KB_TYP_HEADER, KB_SD_JWT_TYP_HEADER,
 };
+
+/// How far a Key Binding JWT's `iat` may sit from the Verifier's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KbJwtIatWindow {
+    /// The oldest `iat` accepted, as an age.
+    pub max_age: Duration,
+    /// How far ahead of the Verifier's clock `iat` may be.
+    pub max_future_skew: Duration,
+}
+
+impl Default for KbJwtIatWindow {
+    fn default() -> Self {
+        KbJwtIatWindow {
+            max_age: Duration::from_secs(300),
+            max_future_skew: Duration::from_secs(60),
+        }
+    }
+}
 
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
@@ -58,6 +77,8 @@ pub struct SDJWTVerifier {
     pub verified_delegate_payloads: Vec<Vec<Map<String, Value>>>,
 
     issuer_key_resolver: Box<dyn KeyResolver>,
+
+    kb_iat_window: KbJwtIatWindow,
 }
 
 impl SDJWTVerifier {
@@ -81,7 +102,15 @@ impl SDJWTVerifier {
             chain_cnfs: Vec::new(),
             #[cfg(feature = "delegate")]
             verified_delegate_payloads: Vec::new(),
+            kb_iat_window: KbJwtIatWindow::default(),
         }
+    }
+
+    /// Sets the window a Key Binding JWT's `iat` must fall in; see [`KbJwtIatWindow`].
+    /// Without it, [`KbJwtIatWindow::default`] applies.
+    pub fn with_kb_iat_window(mut self, window: KbJwtIatWindow) -> Self {
+        self.kb_iat_window = window;
+        self
     }
 
     /// Verifies a SD-JWT (or delegation chain) presentation.
@@ -179,6 +208,7 @@ impl SDJWTVerifier {
                 expected_aud,
                 expected_nonce,
                 Some(&expected_sd_hash),
+                &self.kb_iat_window,
             )?;
         } else {
             // Plain dSD-JWT (no trailing KB-JWT): the credential was delegated
@@ -411,6 +441,7 @@ impl SDJWTVerifier {
             &expected_aud,
             &expected_nonce,
             expected_sd_hash.as_deref(),
+            &self.kb_iat_window,
         )
     }
 
@@ -545,6 +576,7 @@ fn verify_kb_jwt(
     expected_aud: &str,
     expected_nonce: &str,
     expected_sd_hash: Option<&str>,
+    iat_window: &KbJwtIatWindow,
 ) -> Result<()> {
     let sign_alg = SDJWTCommon::decode_header_and_get_sign_algorithm(kb_jwt)
         .unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_string());
@@ -570,6 +602,28 @@ fn verify_kb_jwt(
         if decoded.claims.get(KB_DIGEST_KEY) != Some(&Value::String(expected_sd_hash.to_string())) {
             return Err(Error::InvalidInput("Invalid digest in KB-JWT".to_string()));
         }
+    }
+    verify_kb_jwt_iat(&decoded.claims, iat_window)
+}
+
+/// RFC 9901 §4.3 requires `iat` in the KB-JWT, and §7.3 (step 5e) requires it to be within
+/// an acceptable window of the Verifier's clock. `iat` is a NumericDate (RFC 7519 §2), which
+/// may carry a fractional part.
+fn verify_kb_jwt_iat(claims: &Map<String, Value>, window: &KbJwtIatWindow) -> Result<()> {
+    let iat = claims
+        .get("iat")
+        .ok_or_else(|| Error::InvalidInput("KB-JWT iat is missing".to_string()))?
+        .as_f64()
+        .ok_or_else(|| Error::InvalidInput("KB-JWT iat is not a NumericDate".to_string()))?;
+    let now = (time::OffsetDateTime::now_utc() - time::OffsetDateTime::UNIX_EPOCH).as_seconds_f64();
+
+    if iat > now + window.max_future_skew.as_secs_f64() {
+        return Err(Error::InvalidInput(
+            "KB-JWT iat is in the future".to_string(),
+        ));
+    }
+    if iat < now - window.max_age.as_secs_f64() {
+        return Err(Error::InvalidInput("KB-JWT is too old".to_string()));
     }
     Ok(())
 }
@@ -1506,6 +1560,190 @@ mod tests {
         assert_eq!(claims_to_check, verified_claims);
 
         Ok(())
+    }
+
+    const KB_AUD: &str = "testAud";
+    const KB_NONCE: &str = "testNonce";
+    const ONE_YEAR_SECS: i64 = 365 * 24 * 60 * 60;
+
+    /// A compact SD-JWT+KB presentation (ES256 issuer, EdDSA holder), freshly key-bound.
+    async fn key_bound_presentation() -> String {
+        let user_claims = json!({
+            "iss": "https://example.com/issuer",
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+            "exp": 1883000000,
+            "family_name": "Doe",
+        });
+        let issuer_key = SDJWTKey::new(
+            EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap(),
+            Some("ES256".to_string()),
+        );
+        let sd_jwt = SDJWTIssuer::new(issuer_key)
+            .issue_sd_jwt(
+                user_claims.clone(),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                Some(serde_json::from_str(HOLDER_JWK_KEY_ED25519).unwrap()),
+                false,
+                SDJWTSerializationFormat::Compact,
+                None,
+            )
+            .await
+            .unwrap();
+        let holder_key = EncodingKey::from_ed_pem(HOLDER_KEY_ED25519.as_bytes()).unwrap();
+        SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+            .unwrap()
+            .create_presentation(
+                user_claims.as_object().unwrap().clone(),
+                Some(KB_NONCE.to_string()),
+                Some(KB_AUD.to_string()),
+                Some(SDJWTKey::new(holder_key, Some("EdDSA".to_string()))),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// `presentation` with its KB-JWT payload changed by `edit` and re-signed by the holder.
+    fn with_kb_jwt_payload(
+        presentation: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+    ) -> String {
+        use base64::Engine;
+        let (sd_jwt, kb_jwt) = presentation.rsplit_once('~').unwrap();
+        let payload = kb_jwt.split('.').nth(1).unwrap();
+        let mut claims: serde_json::Map<String, Value> = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        edit(&mut claims);
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.typ = Some(crate::KB_JWT_TYP_HEADER.to_string());
+        let holder_key = EncodingKey::from_ed_pem(HOLDER_KEY_ED25519.as_bytes()).unwrap();
+        let kb_jwt = jsonwebtoken::encode(&header, &claims, &holder_key).unwrap();
+        format!("{sd_jwt}~{kb_jwt}")
+    }
+
+    async fn verify_key_bound(
+        presentation: String,
+        window: Option<super::KbJwtIatWindow>,
+    ) -> crate::error::Result<Value> {
+        let issuer_pub_key: SDJWTPubKey = DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes())
+            .unwrap()
+            .into();
+        let mut verifier = SDJWTVerifier::new(Box::new(issuer_pub_key));
+        if let Some(window) = window {
+            verifier = verifier.with_kb_iat_window(window);
+        }
+        verifier
+            .verify_presentation(
+                presentation,
+                Some(KB_AUD.to_string()),
+                Some(KB_NONCE.to_string()),
+                SDJWTSerializationFormat::Compact,
+            )
+            .await
+    }
+
+    fn assert_invalid_input(result: crate::error::Result<Value>, expected: &str) {
+        match result {
+            Err(crate::error::Error::InvalidInput(message)) => assert_eq!(message, expected),
+            other => panic!("expected InvalidInput({expected:?}), got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::now(0, None)]
+    #[case::within_max_age(-290, None)]
+    #[case::within_future_skew(50, None)]
+    #[case::just_past_max_age(-310, Some("KB-JWT is too old"))]
+    #[case::just_past_future_skew(70, Some("KB-JWT iat is in the future"))]
+    #[case::a_year_ago(-ONE_YEAR_SECS, Some("KB-JWT is too old"))]
+    #[case::a_year_ahead(ONE_YEAR_SECS, Some("KB-JWT iat is in the future"))]
+    #[async_std::test]
+    async fn verify_checks_the_kb_jwt_iat_against_the_default_window(
+        #[case] offset_secs: i64,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let iat = time::OffsetDateTime::now_utc().unix_timestamp() + offset_secs;
+        let presentation = with_kb_jwt_payload(&key_bound_presentation().await, |claims| {
+            claims.insert("iat".to_string(), iat.into());
+        });
+
+        let result = verify_key_bound(presentation, None).await;
+
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(expected) => assert_invalid_input(result, expected),
+        }
+    }
+
+    #[async_std::test]
+    async fn verify_rejects_a_kb_jwt_without_iat() {
+        let presentation = with_kb_jwt_payload(&key_bound_presentation().await, |claims| {
+            claims.remove("iat");
+        });
+
+        let result = verify_key_bound(presentation, None).await;
+
+        assert_invalid_input(result, "KB-JWT iat is missing");
+    }
+
+    #[rstest::rstest]
+    #[case::within_the_window(-10.5, None)]
+    #[case::past_max_age(-310.5, Some("KB-JWT is too old"))]
+    #[case::past_future_skew(70.5, Some("KB-JWT iat is in the future"))]
+    #[async_std::test]
+    async fn verify_checks_a_fractional_kb_jwt_iat(
+        #[case] offset_secs: f64,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let now =
+            (time::OffsetDateTime::now_utc() - time::OffsetDateTime::UNIX_EPOCH).as_seconds_f64();
+        let presentation = with_kb_jwt_payload(&key_bound_presentation().await, |claims| {
+            claims.insert("iat".to_string(), Value::from(now + offset_secs));
+        });
+
+        let result = verify_key_bound(presentation, None).await;
+
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(expected) => assert_invalid_input(result, expected),
+        }
+    }
+
+    #[async_std::test]
+    async fn verify_rejects_a_kb_jwt_whose_iat_is_not_a_number() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let presentation = with_kb_jwt_payload(&key_bound_presentation().await, |claims| {
+            claims.insert("iat".to_string(), Value::String(now.to_string()));
+        });
+
+        let result = verify_key_bound(presentation, None).await;
+
+        assert_invalid_input(result, "KB-JWT iat is not a NumericDate");
+    }
+
+    #[async_std::test]
+    async fn verify_applies_a_custom_kb_jwt_iat_window() {
+        let an_hour_ago = time::OffsetDateTime::now_utc().unix_timestamp() - 3600;
+        let presentation = with_kb_jwt_payload(&key_bound_presentation().await, |claims| {
+            claims.insert("iat".to_string(), an_hour_ago.into());
+        });
+        let a_day = super::KbJwtIatWindow {
+            max_age: std::time::Duration::from_secs(24 * 60 * 60),
+            max_future_skew: std::time::Duration::from_secs(60),
+        };
+
+        assert_invalid_input(
+            verify_key_bound(presentation.clone(), None).await,
+            "KB-JWT is too old",
+        );
+        verify_key_bound(presentation, Some(a_day)).await.unwrap();
     }
 
     fn issued(payload: Value, disclosures: &[&str]) -> String {
