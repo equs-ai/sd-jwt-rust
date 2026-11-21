@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use strum::Display;
 pub use {
     holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy, issuer::SDJWTIssuer,
-    verifier::SDJWTVerifier,
+    verifier::KbJwtIatWindow, verifier::SDJWTVerifier,
 };
 
 #[cfg(feature = "delegate")]
