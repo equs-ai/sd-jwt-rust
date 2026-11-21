@@ -33,11 +33,21 @@ use crate::{
 
 /// How far a Key Binding JWT's `iat` may sit from the Verifier's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KbJwtIatWindow {
     /// The oldest `iat` accepted, as an age.
     pub max_age: Duration,
     /// How far ahead of the Verifier's clock `iat` may be.
     pub max_future_skew: Duration,
+}
+
+impl KbJwtIatWindow {
+    pub fn new(max_age: Duration, max_future_skew: Duration) -> Self {
+        KbJwtIatWindow {
+            max_age,
+            max_future_skew,
+        }
+    }
 }
 
 impl Default for KbJwtIatWindow {
